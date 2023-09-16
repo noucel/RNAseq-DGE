@@ -19,6 +19,8 @@ Also, intall from the CRAN package repository the R packages tidyverse and DT.
 
 Open the RNAseq-DGE workflow scripts.
 
+For maping the RNAseq reads download the Genome database form the linked provided in the files as .fa format.
+
 
 ## Workflow Overview
 

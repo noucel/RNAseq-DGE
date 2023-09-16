@@ -11,7 +11,7 @@ As a more detailed report, the resulting genes can be classified by their Gene O
 
 ## Prerequisites
 
-Install the following R packages from Bioconductor limma, edgeR, Glimma, org.Mm.eg.db, GOstats, gplots, RColorBrewer, NMF, BiasedUrn, fastqrc, Rsubread.
+Install the following R packages from Bioconductor limma, edgeR, Glimma, biomaRt, org.Mm.eg.db, GOstats, gplots, RColorBrewer, NMF, BiasedUrn, fastqrc, Rsubread.
 Also, intall from the CRAN package repository the R packages tidyverse and DT. 
 
 

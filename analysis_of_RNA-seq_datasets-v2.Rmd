@@ -1,0 +1,697 @@
+---
+title: "Differential Gene Expression Analysis of RNA-Seq Datasets"
+author: "Marc Rigau"
+date: "16/5/2022"
+output: html_document
+# output: pdf_document
+# documentclass: article
+# fontsize: 11pt
+# geometry: margin=1in
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+### Preamble
+
+The transcriptome of cells comprises the set of all RNA transcripts, including coding and non-coding, in an individual or a population of cells.
+Transcripts can be mapped back to the reference genome and quantify which genes are expressed for a given sample.
+Examining the differences of gene expression between samples can provide an insight of which genes may be relevant after comparing the two or more conditions that the samples have been subjected.
+
+## Load Packages
+
+Install the packages from Bioconductor if needed:
+```{r, echo = F }
+if ( !requireNamespace( "BiocManager" ) )
+install.packages( "BiocManager" )
+BiocManager::install( c( "edgeR", 'limma', "Glimma", "org.Mm.eg.db", "RColorBrewer", "NMF", "BiasedUrn", 'Rsubread' ) )
+
+library( fastqcr ) # A high throughput sequence QC analysis tool
+fastqc_install() # Required to install the FastQC Tool on Unix systems (Mac OSX and Linux)
+
+library(dplyr)
+
+```
+
+
+
+### Make Quality Control Reports for Fastq Datasets
+
+The GEO repository stores most data considered for RNA-Seq experiments.
+Individual runs can be found via the [SRA Explorer website](https://sra-explorer.info/) and downloaded directly using their batch command line instructions.
+Raw sequencing data is provided as a Fastq file format, which is a well defined text-based format for storing both biological nucleotide sequences and their corresponding quality scores.
+
+Set the working directory and path to raw RNAseq datasets
+```{r, echo = F }
+wd <- "/Volumes/WolfeCreek/Marc/RNAseq"
+RawFastq.dir <- file.path( wd, 'Fastq-Raw' )
+
+# List the files in the raw Fastq files directory
+dir( RawFastq.dir, include.dirs = T )
+
+# Set the path to a new output directory
+fastQC.dir <- file.path( wd.dir, 'FastQC')
+
+```
+
+```{r, echo = F }
+# Run a FastQC tool:
+fastqc(fq.dir = RawFastq.dir, # Input directory
+       qc.dir = fastqc.output.dir, # Output direcory
+       threads = 64 # Number of threads
+)
+```
+
+
+## Aggregate Reports
+
+Reports from all data files can be aggregated into a single document to facilitate the visualization and quick detection of anomalies in the files.
+Tables are built to rank all samples accordingly to the names of tested fastQC modules, the status of the test, and some general statistics including the number of reads (tot.seq), the length of reads (seq.length), the percentage of GC content (pct.gc), and the percentage of duplicate reads (pct.dup).
+
+```{r, echo = T }
+# Aggregate files in the directory containing zipped fastQC reports
+qc <- qc_aggregate( fastQC.dir )
+head( qc )
+```
+
+# Inspect modules that failed or warned in samples.
+
+```{r, echo = F }
+fails.and.warns <- qc %>%
+                      select( sample, module, status ) %>%
+                      filter( status %in% c( "WARN", "FAIL" ) ) %>%
+                      arrange( sample )
+```
+
+# Summarize Reports
+
+A summary and general statistics of the aggregated data.
+
+```{r, echo = T }
+summary( qc )
+```
+
+# General Statistics
+
+The following table shows general statistics for each sample:
+
+```{r, echo = T }
+( fastQC.stats <- qc_stats( qc ) )
+```
+
+1. Inspecting Problems
+
+Inspect samples or modules that returned a failure, warning, or problem to figure out what (if anything) could have been wrong with the dataset.
+
+Display the samples or modules that failed
+```{r, echo = T }
+# Display outcomes
+qc_fails( qc )
+qc_warns( qc )
+qc_problems( qc )
+
+# Assess aggregated data from the previous table
+qc
+```
+
+3. Output data
+
+The module output is by default in a compact format.
+However, for a stretched format, cancel the argument **compact**.
+To display problems for one or more specified modules change the argument **name**.
+Under the name argument, partial matching of name is allowed.
+For example, name = “Per sequence GC content” equates to name = “GC content”.
+
+The problems by module are called with the below command lines.
+These problems can also be specified by fails or warns, as well (qc_fails/qc_warns( qc, 'module' ) ).
+
+
+```{r, echo = T }
+# For modules that either failed or warned:
+qc_problems( qc, "module", compact = FALSE, name = "GC content" )
+```
+
+Samples with one or more failed modules
+```{r, echo = T }
+qc_problems( qc, "sample", compact = FALSE, name = "K562" )
+```
+
+
+
+
+
+
+### Mapping
+
+
+Load the required libraries.
+```{r, echo = F }
+library( tidyverse ) # Kernel for statistics in science fields.
+library( Rsubread ) # Map the reads to the reference genome (eg. the human genome “hg19”) (Y et al. 2013).
+```
+
+
+## Built the Reference Genome Index
+
+**_NOTE:_** Rsubread provides reference genome indices for the most common two organisms: human and mouse. If working with a different organism, build a new index using the buildindex command.
+
+Build a default base-space from a *fasta* file containing the indexes of the reference genome.
+Compressed files are also accepted.
+
+Name the reference genome raw fasta file and define the name and output directory of the reference index.
+```{r, echo = F }
+reference.genome.file.name <- "genome_GRCh38_p13.fa"
+ref.genome.dir <- file.path( RNAseqFastq.dir, "GENCODE-Human_Release-40-Index" )
+human.genome <- "GRCh38.p13"
+```
+
+Built a hash table index for the reference genome to create the reference genome information file (1-2 h process).
+```{r, echo = F }
+#Build the index
+#buildindex( basename = file.path( ref.genome.dir, human.genome ),
+#            reference = file.path( ref.genome.dir, reference.genome.file.name ),
+#            gappedIndex	= T
+#            )
+```
+
+
+## Alignment of Reads to the Reference Genome
+
+Aligned reads to the reference genome are usually produced in the form of a *Binary Alignment Map* (BAM) which is the most comprehensive raw data of genome sequencing.
+BAM files consists of lossless, compressed binary representation of the *Sequence Alignment Map* files.
+BAM is also the compressed binary representation of SAM, a compact and index-able representation of nucleotide sequence alignments.
+
+Define the Raw data files for the forward read files and set a new directory for storing the new mapped *bam* files.
+```{r, echo = F }
+read.files.fwd <- list.files( RawFastq.dir, pattern = "1.fastq.gz$" )
+read.files.fwd.path <- file.path( RawFastq.dir, read.files.fwd )
+
+# Define the Raw data files for the reverse read files
+read.files.rvs <- list.files( RawFastq.dir, pattern = "2.fastq.gz$" )
+read.files.rvs.path <- file.path( RawFastq.dir, read.files.rvs )
+
+all.equal( length( read.files.fwd ), length( read.files.rvs ) )
+
+#Define the Mapping directory for the alignment files
+mapping.dir <- file.path( wd, 'Mapped' )
+
+# Define the output data files
+sample.name <- substr( read.files.fwd, 1, nchar( read.files.fwd) -11 )
+output.BAM.file.names <- paste0( sample.name, '.bam' )
+
+# Define the directory path of the alignment file output
+output.BAM.file.names.path <- file.path( mapping.dir, output.BAM.file.names )
+```
+
+Align the reads to the reference genome
+```{r, echo = F }
+align( index = file.path( ref.genome.dir, human.genome ),
+       readfile1 = read.files.fwd.path,
+       readfile2 = read.files.rvs.path,
+       type = 'rna',
+       maxMismatches = 3, # Miss-matches found in soft-clipped bases are not counted.
+       output_file = output.BAM.file.names.path,
+       nthreads = 8, # Speed up the process by running several CPUs in parallel.
+       output_format = "BAM"
+)
+```
+
+
+Summarize the mapped read sequences
+```{r, echo = T }
+propmapped( output.BAM.file.names.path )
+```
+
+
+
+
+
+
+### Count Reads for each Feature
+
+
+Mapped sequencing reads must be assigned to genes based on the index previously built.
+
+```{r echo = F }
+counts <- list.files( mapping.dir, pattern = ".bam$" )
+counts
+```
+
+Assign mapped sequencing reads to specified genomic features
+
+```{r echo = F}
+fc <- featureCounts( file.path( mapping.dir, counts ),
+                     annot.ext = file.path( ref.genome.dir, "gencode_v40_annotation.gtf" ),
+                     isGTFAnnotationFile = TRUE,
+                     isPairedEnd = TRUE,
+                     GTF.attrType = "gene_name",
+                     nthreads = 64,
+                     requireBothEndsMapped = TRUE,
+                     verbose = FALSE
+)
+```
+
+Summary of the output object
+```{r echo = T}
+summary( fc )
+dim( fc$counts )
+```
+
+Name by unique and stable GEO accession number
+```{r echo = T}
+colnames( fc$counts ) <- substr( colnames( fc$counts ), 13, 22 )
+fc$counts[ 1:2, ]
+```
+
+Define the directory for the count files and save the output data in a tabular separated table format
+```{r echo = F}
+ws.dir <- "~/UniMelb/Datasets/RNAseq"
+counts.dir <- paste0( ws.dir, "/Counts" )
+
+write.table(fc$counts,
+            file = file.path( counts.dir, "featureCounts_Homo_sapiens_RNA-Seq.txt" ),
+            sep="\t", quote=F, append=F, row.names = T )
+```
+
+
+
+## Quality Control and Stats
+
+Import or built an experiment design table to assign sample information such as the one below:
+
+```{r echo = F}
+GEO <- substr( counts, 13, 22 ) # Name by unique and stable GEO accession number
+Species <- c( rep( 'Homo Sapiens', length( counts ) ) )
+Speciment <- c( rep( 'U266', 6), rep( 'K562', 3), rep( 'U266', 2), rep( 'K562', 2) )
+Batch <- c( '4h', '24h', '4h', '24h', '4h', '24h', 'Cnt', 'Cnt', 'Cnt', 'scrbl', 'scrbl', 'WT', 'WT'  )
+Replicate <- c( 1, 1, 2, 2, 3, 3, 1, 2, 3, 1, 2, 1, 2 )
+
+# Assemble a design dataframe
+sample.annotation <- as.data.frame(  cbind(Species, Speciment, Batch, Replicate), row.names = GEO )
+```
+
+
+List samples in an object, make common names to identify each sample, and grup the speciments according to the question to analyse.
+```{r echo = T}
+# List samples
+samples <- as.character( rownames( sample.annotation) )
+
+# Make common sample names
+tags <- as.factor( paste( group, Batch, Replicate ) )
+tags
+
+# Group samples by factors
+group <- factor( sample.annotation$Speciment )
+table( group )
+```
+
+
+## Basic Quality Control Plots
+
+Define the output for Rplots directory
+
+```{r echo = F}
+Rplots.dir <- paste0( ws.dir, "/Rplots" )
+```
+
+Create density plots of log-intensity distribution for each library.
+
+```{r echo = T}
+x.max <- max( log( fc$counts, 10 ) )
+
+# Density plot of raw read counts (log10)
+for ( i in 1:length( samples ) ) {
+  logcounts <- log( fc$counts[ , i ], 10 )
+  d <- density( logcounts )
+  if ( i == 1 ) plot( d, xlim = c( 0, x.max), ylim = c( 0, 0.24 ), main = "", xlab = "Raw read counts per gene (log10)", ylab = "Density", col = colors()[ 10 ], lwd = 3 )
+  else lines( d, col = colors()[ 5 * i ], lwd = 3 )
+}
+```
+
+
+Make a series of boxplots of the raw read counts after log10 transformation
+```{r echo = T}
+logcounts <- log( fc$counts, 10 )
+
+# Ignore -Inf values; instead consider non-expressed gene 'NA' or replace it by a constant EPSILON
+EPSILON = NA # 1E-10
+logcounts[ is.infinite( logcounts ) ] <- EPSILON
+colnames( logcounts ) <- tags
+boxplot( logcounts, main = "", alpha= 0.1, xlab = "", ylab = "Raw read counts per gene (log10)" )
+```
+
+
+Cluster hierarchicaly to investigate the relationship between samples and make a heatmap of the highest expressed genes to euclide distances.
+Select data for the most highly expressed genes using a set threshold.
+```{r echo = T}
+threshold <- 100
+temp = order( rowMeans( fc$counts ), decreasing = TRUE )[ 1:threshold ]
+top.gene.counts <- fc$counts[ temp, ]
+
+# To better understand what biological effect lies under this clustering, use the samples annotation for labeling.
+colnames( top.gene.counts ) <- tags
+
+# Heatmap
+heatmap( top.gene.counts, col = heat.colors( threshold, alpha= 1, rev = FALSE ) )
+```
+
+
+
+## Principal Component Analysis
+
+Principal Component Analysis (PCA) from the *cmdscale* function (from the stats package) performs a classical multidimensional scaling of a data matrix.
+Reads counts are transposed before being analysed with the cmdscale functions (i.e. genes should be in columns and samples should be in rows).
+A matrix of dissimilarities from your transposed data is computed
+Also the information about the proportion of explained variance is provided by calculating Eigen values.
+
+Thereafter, a matrix of dissimilarities or classical multidimensional scaling (MDS) of a data is calculated.
+This is also known as principal coordinates analysis (Gower, 1966).
+
+
+```{r echo = T}
+#Select data for the most highly expressed genes
+threshold <- 100
+highly.expressed.gene.counts = order( rowMeans( fc$counts ), decreasing = TRUE )[ 1:threshold ]
+highly.expressed.gene.counts <- fc$counts[ highly.expressed.gene.counts, ]
+
+# Annotate the data with condition group as labels
+colnames( highly.expressed.gene.counts ) <- tags
+
+# Transpose the data to have variables (genes) as columns
+data.for.PCA <- t( highly.expressed.gene.counts )
+dim( data.for.PCA )
+
+mds <- cmdscale( dist( data.for.PCA ), k = 3, eig = TRUE )  
+# k = the maximum dimension of the space which the data are to be represented in
+# eig = indicates whether eigenvalues should be returned
+
+# The variable mds$eig provides the Eigen values for the first 8 principal components:
+mds$eig
+```
+
+
+Plotting the variable as a percentage determines how many components can explain the variability in the dataset and how many dimensions you should be looking at.
+
+```{r echo = T}
+# Transform the Eigen values into percentage
+eig.percentage <- mds$eig * 100 / sum( mds$eig )
+
+# plot the PCA
+barplot(eig.percentage,
+        las = 1,
+        xlab = "Dimensions", 
+        ylab = "Proportion of explained variance (%)", y.axis = NULL,
+        col = "skyblue" )
+```
+
+In most cases, the first two components can explain more than half the variability in the dataset and are the ones used for plotting, although more components can be used to increase the number of dimensions in which the data is represented.
+The cmdscale function run with default parameters performs a PCA on the given data matrix whereas the plot function provides scatter plots for individuals representation.
+
+```{r echo = T}
+# Calculate MDS
+mds <- cmdscale( dist( data.for.PCA ) ) # Performs MDS analysis 
+
+# Samples representation
+plot( mds[ , 1 ], -mds[ , 2 ], type = "n", xlab = "Dimension 1", ylab = "Dimension 2", main = "")
+text( mds[ , 1 ], -mds[ , 2 ], rownames( mds ), cex = 0.8) 
+```
+
+To interpret well this data, the first two components in the PCA plot should show a clear separation between sample groups across the 1st or 2nd dimension.
+Each of group of samples represent a cluster.
+However, different factors can show other type of variability among the data, often driven by biological bias such as samples exposed to treatment conditions, organism, or cell type.
+
+
+
+
+
+
+
+
+
+
+### Differential Gene Expression Analysis
+
+
+```{r echo = F}
+# load required libraries
+library( edgeR )
+```
+
+
+# Obtain the expression counts from previous alignment step
+mycounts <- read.table( file.path( counts.dir, "featureCounts_Homo_sapiens_RNA-Seq.txt" ), header = T )
+dim( mycounts )
+head( mycounts )
+
+# Filtering
+# Filter very lowly expressed genes to increases the statistical power of the analysis while keeping genes of interest.
+# Keep genes with least 'x' count-per-million reads (cpm) in at least 'n' samples
+
+isexpr <- rowSums( cpm( mycounts ) > 1) >= 4
+table( isexpr )
+
+mycounts <- mycounts[ isexpr, ]
+genes <- rownames( mycounts )
+
+dim( mycounts )
+
+# The voom function of the limma package normalises counts and applies a linear model to the data before computing moderated t-statistics of differential expression.
+# Load required libraries
+
+# Check if the grouping of samples matches the exeriment design annotations
+sample.annotation[ colnames( mycounts ), ]$Speciment == group
+
+# Create design matrix for limma
+design.matrix <- model.matrix( ~0 + group )
+
+# Substitute "group" from the design column names
+colnames( design.matrix ) <- gsub( "group", "", colnames( design.matrix ) )
+
+# Check your design matrix
+design.matrix
+
+# Calculate normalization factors between libraries
+nf <- calcNormFactors( mycounts )
+
+# Normalise the read counts with 'voom' function
+# voom is a function in the limma package that modifies RNA-Seq data for use with limma.
+y <- voom( mycounts, design.matrix, lib.size = colSums( mycounts ) * nf )
+
+
+# Extract the normalised read counts
+counts.voom <- y$E
+
+# Save normalised expression data into output dir
+write.table( counts.voom,
+             file = file.path( counts.dir, "featureCounts_Homo_sapiens_RNA-Seq.txt" ),
+             row.names = T , quote = F, sep = "\t" )
+
+# Fit linear model for each gene given a series of libraries
+fit <- lmFit( y, design.matrix )
+
+# Construct the contrast matrix corresponding to specified contrasts of a set of parameters
+cont.matrix <- makeContrasts( U266-K562, levels = design.matrix )
+cont.matrix 
+
+# Compute estimated coefficients and standard errors for a given set of contrasts
+fit <- contrasts.fit( fit, cont.matrix )
+
+# compute moderated t-statistics of differential expression by empirical Bayes moderation of the standard errors
+fit <- eBayes( fit )
+options( digits = 3 )
+
+# check the output fit
+dim( fit )
+
+# The topTable function summarises the output from limma in a table format.
+# Significant differential expression (DE) genes for a particular comparison can be identified by selecting genes with a p-value smaller than a chosen cut-off value and/or a fold change greater than a chosen value in this table.
+# By default the table will be sorted by increasing adjusted p-value, showing the most significant DE genes at the top.
+
+# Set adjusted pvalue threshold and log fold change threshold
+mypval = 0.01
+myfc = 3
+
+# Obtain the coefficient name for the comparison  of interest
+colnames( fit$coefficients )
+
+# Obtain the output table for the 10 most significant DE genes for this comparison
+mycoef = colnames( fit$coefficients )
+topTable( fit, coef = mycoef )
+
+# Obtain the full table ("n = number of genes in the fit")
+limma.table <- topTable( fit, coef = mycoef, n = dim( fit )[ 1 ] )
+dim( limma.table )
+
+# Cut results to significant DE genes only ( adjusted p-value < mypval )
+limma.table.mypval <- topTable( fit, coef = mycoef, n = dim( fit )[ 1 ], p.val = mypval )
+dim( limma.table.mypval )
+
+# Cut results to significant DE genes with low adjusted p-value high fold change
+limma.table.mypval.myfc <- gene.mypval[ which( abs( gene.mypval$logFC ) > myfc ), ]
+dim( limma.table.mypval.myfc )
+
+# Write the limma output table for significant genes into a tab delimited file
+filename.dge = paste( "DGE_", mycoef, "_pvalue-", mypval, "_logFoldChange-", myfc, ".txt", sep="" )
+filename.dge.path = file.path( counts.dir, filename.dge )
+
+write.table( limma.table.mypval.myfc, file=filename.dge.path, row.names = T, quote = F, sep = "\t" )
+
+
+# Plot a specified coefficient of the linear model
+volcanoplot(fit = fit,
+            coef = 1,
+            style = "p-value",
+            highlight = 100,
+            names = rownames( fit ),
+            hl.col = "blue",
+            xlab = "Log2 Fold Change"
+)
+
+
+# # Oorganize the labels nicely using the "ggrepel" package and the geom_text_repel() function
+# library(ggrepel)
+# 
+# # The significantly differentially expressed genes are the ones found in the upper-left and upper-right corners.
+# # Add a column to the data frame to specify if they have a Higher- or Lower- expression (log2FoldChange respectively positive or negative)
+# 
+# # add a column of NAs
+# limma.res.pval.FC$diffexpressed <- "Similar"
+# # if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+# limma.res.pval.FC$diffexpressed[limma.res.pval.FC$logFC > 0.6 & limma.res.pval.FC$P.Value < 0.05] <- "Higher"
+# # if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+# limma.res.pval.FC$diffexpressed[limma.res.pval.FC$logFC < -0.6 & limma.res.pval.FC$P.Value < 0.05] <- "Lower"
+# 
+# 
+# # ggplot( data=limma.res.pval.FC, aes( x = limma.res.pval.FC$logFC, y = -log10( limma.res.pval.FC$P.Value ), col = limma.res.pval.FC$diffexpressed, label = rownames( limma.res.pval.FC ) ) ) +
+# #   geom_point() + 
+# #   theme_minimal() +
+# #   geom_text_repel() +
+# #   scale_color_manual(values=c("blue", "black", "red")) +
+# #   geom_vline(xintercept=c(-0.6, 0.6), col="red") +
+# #   geom_hline(yintercept=-log10(0.05), col="red")
+
+
+
+
+##################################################################
+### Gene Annotation
+##################################################################
+
+# Add annotations of the BioMart database to obtain information about the target genes.
+# Load the Ensembl annotation for human genome form the BioConductor repository
+# BiocManager::install("biomaRt")
+library( biomaRt )
+
+# Select a BioMart database and dataset
+listMarts()
+useMart( "ensembl" )
+
+# Connect to a specific BioMart database
+ensembl = useMart( "ensembl" )
+
+# View all datasets in the database
+listDatasets( ensembl )
+
+# If known dataset, select a BioMart database in a single step:
+ensembl = useDataset( "hsapiens_gene_ensembl", mart = ensembl )
+
+# Alternatively, if the database is already known use the following command
+#ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+
+
+#################################################################
+# Build a biomaRt query
+
+# Prepare the three main parameters for a BiomaRT querry
+
+# 1 Filters
+filters = listFilters( ensembl )
+filters[ 1:10,  ]
+
+# Attributes
+attributes = listAttributes( ensembl )
+attributes[ 1:25, ]
+
+# Main BiomaRT command:
+# attributes: is a vector of attributes that one wants to retrieve (= the output of the query).
+# filters: is a vector of filters that one wil use as input to the query.
+# values: a vector of values for the filters. In case multple filters are in use, the values argument requires a list of values where each position in the list corresponds to the position of the filters in the filters argument (see examples below).
+# mart: is an object of class Mart, which is created by the useMart() function.
+
+# Note: for some frequently used queries to Ensembl, wrapper functions are available: getGene() and getSequence().
+# These functions call the getBM() function with hard coded filter and attribute names.
+
+# BioMart query
+
+# Pull gene IDs from limma output table
+hgnc_genes <- as.character( rownames( limma.table.mypval.myfc ) )
+length( hgnc_genes )
+
+detags.IDs <- getBM( attributes = c('hgnc_symbol', 'entrezgene_id', 'ensembl_gene_id', 'ensembl_transcript_id', 'chromosome_name', 'band', 'strand', 'description' ),
+                     filters = 'hgnc_symbol', 
+                     values = hgnc_genes, 
+                     mart = ensembl )
+dim( detags.IDs )
+head( detags.IDs )
+
+
+# Remove duplicates
+detags.IDs.matrix <- detags.IDs[ -which( duplicated( detags.IDs$hgnc_symbol ) ), ]
+
+# Select genes of interest only
+rownames( detags.IDs.matrix ) <- detags.IDs.matrix$hgnc_symbol
+hgnc_genes.annot <- detags.IDs.matrix[ as.character( hgnc_genes ), ]
+
+# Join the two tables
+top.genes.annot <- cbind( hgnc_genes.annot, limma.table.mypval.myfc )
+head( top.genes.annot )
+
+# Write limma output table for significant genes into a tab delimited file
+filename.dge.annot = paste( substr( filename.dge, 1, nchar( filename.dge) -4 ), '_Annotation', ".txt", sep="" )
+filename.dge.annot.path = file.path( counts.dir, filename.dge.annot )
+
+write.table( top.genes.annot, file = filename.dge.annot.path, row.names = T, quote = F, sep = "\t" )
+
+
+
+
+##################################################################
+### Software and Code Used
+##################################################################
+sessionInfo()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##################################################################
+### Software and Code Used
+##################################################################
+sessionInfo()
+
+
+
+
+
+
+

@@ -9,18 +9,6 @@ Fasta files are to be downloaded and processed. Once this raw data is obtained, 
 As a more detailed report, the resulting genes can be classified by their Gene Ontology (GO) enrichment. This is a method for investigating sets of genes using the GO system of classification, in which genes are assigned to a particular set of terms for three major domains considering cellular component, biological process, and molecular function.
 
 
-## Table of Contents
-
-Introduction
-Prerequisites
-Installation
-Workflow Overview
-Data
-Results
-Contributing
-License
-Introduction
-
 ## Prerequisites
 
 Install the following R packages from Bioconductor limma, edgeR, Glimma, org.Mm.eg.db, GOstats, gplots, RColorBrewer, NMF, BiasedUrn, fastqrc, Rsubread.
